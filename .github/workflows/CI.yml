@@ -12,7 +12,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - name: Install openssl libs
-      run: sudo apt-get install openssl libssl-dev
+      run: sudo apt-get install pkg-config libssl-dev
     - uses: actions/checkout@v3
     - uses: messense/maturin-action@v1
       with:
