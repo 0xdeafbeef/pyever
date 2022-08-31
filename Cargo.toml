@@ -15,9 +15,7 @@ everscale-jrpc-client = { git = "https://github.com/broxus/everscale-jrpc.git" }
 hex = "0.4.3"
 
 nekoton = { git = "https://github.com/broxus/nekoton.git", default-features = false }
-nekoton-utils = { git = "https://github.com/broxus/nekoton.git", default-features = false }
 pyo3 = { version = "0.16", features = ["extension-module", "anyhow"] }
-pyo3-asyncio = { version = "0.16", features = ["attributes", "tokio-runtime"] }
 
 ton_block = { git = "https://github.com/broxus/ton-labs-block.git", default-features = false }
 tokio = "1.20.1"
