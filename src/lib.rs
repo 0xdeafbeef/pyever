@@ -1,6 +1,7 @@
 use anyhow::Context;
 use anyhow::Result;
-use ed25519_dalek::Signer;
+use ed25519_dalek::Verifier;
+use ed25519_dalek::{PublicKey, Signer};
 use everscale_jrpc_client::{
     JrpcClient, JrpcClientOptions, SendOptions, SendStatus, TransportErrorAction,
 };
@@ -12,6 +13,8 @@ use std::str::FromStr;
 use std::time::Duration;
 use tokio::sync::Mutex;
 use ton_block::MsgAddressInt;
+
+mod utils;
 
 #[pyclass]
 pub struct TonSigner {
@@ -65,6 +68,45 @@ impl TonSigner {
             .ctx
             .block_on(async { send_evers_inner(self, to, amount).await })?)
     }
+
+    #[pyo3(text_signature = "($self, address: str, signature: str, message: str)")]
+    pub fn check_signature(&self, address: &str, signature: &str, message: &str) -> PyResult<bool> {
+        let address = ton_block::MsgAddressInt::from_str(address).context("Invalid address")?;
+        let signature = hex::decode(signature).context("Failed decoding signature hex string")?;
+        let message = hex::decode(message).context("Failed decoding message string")?;
+        if signature.len() != 64 {
+            return Err(anyhow::anyhow!("signature should be 128 hex symbols in len").into());
+        }
+
+        let signature = ed25519_dalek::Signature::from_bytes(signature.as_slice())
+            .context("Failed decoding signature")?;
+        let res = self
+            .ctx
+            .block_on(async { check_signature(self, &address, &signature, &message).await })?;
+        let res = match res {
+            Some(res) => res,
+            None => return Err(anyhow::anyhow!("{address} state is not found").into()),
+        };
+
+        Ok(res)
+    }
+}
+
+async fn check_signature(
+    client: &TonSigner,
+    address: &MsgAddressInt,
+    signature: &ed25519_dalek::Signature,
+    message: &[u8],
+) -> Result<Option<bool>> {
+    let state = client.client.get_contract_state(address).await?;
+    let state = match state {
+        Some(state) => state,
+        None => return Ok(None),
+    };
+
+    let pubkey = utils::extract_public_key(&state.account).context("Failed to get pubkey")?;
+
+    Ok(Some(pubkey.verify(message, signature).is_ok()))
 }
 
 async fn send_evers_inner(client: &TonSigner, to: MsgAddressInt, amount: u64) -> Result<String> {
@@ -98,7 +140,7 @@ async fn send_evers_inner(client: &TonSigner, to: MsgAddressInt, amount: u64) ->
 
     let message = match tx {
         TransferAction::DeployFirst => {
-            unreachable!("Wallev3 doesn't need to be deployed")
+            unreachable!("Wallet3 doesn't need to be deployed")
         }
         TransferAction::Sign(m) => m,
     };
