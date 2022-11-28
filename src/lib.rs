@@ -1,18 +1,21 @@
+use std::str::FromStr;
+use std::time::Duration;
+
 use anyhow::Context;
 use anyhow::Result;
+use ed25519_dalek::Signer;
 use ed25519_dalek::Verifier;
-use ed25519_dalek::{PublicKey, Signer};
 use everscale_jrpc_client::{
     JrpcClient, JrpcClientOptions, SendOptions, SendStatus, TransportErrorAction,
 };
+use nekoton::abi;
 use nekoton::core::models::Expiration;
 use nekoton::core::ton_wallet::{wallet_v3, Gift, TransferAction, WalletType};
 use nekoton::crypto::MnemonicType;
 use pyo3::prelude::*;
-use std::str::FromStr;
-use std::time::Duration;
 use tokio::sync::Mutex;
 use ton_block::MsgAddressInt;
+use ton_types::SliceData;
 
 mod utils;
 
@@ -66,7 +69,31 @@ impl TonSigner {
 
         Ok(self
             .ctx
-            .block_on(async { send_evers_inner(self, to, amount).await })?)
+            .block_on(async { send_evers_inner(self, to, amount, None).await })?)
+    }
+
+    #[pyo3(text_signature = "($self, contract_address, attach_amount, abi, method, arguments)")]
+    pub fn call(
+        &self,
+        contract_address: &str,
+        attach_amount: u64,
+        abi: &str,
+        method: &str,
+        arguments: &str,
+    ) -> PyResult<String> {
+        let res = self.ctx.block_on(async {
+            call(
+                self,
+                contract_address,
+                attach_amount,
+                abi,
+                method,
+                arguments,
+            )
+            .await
+        })?;
+
+        Ok(res)
     }
 
     #[pyo3(text_signature = "($self, address: str, signature: str, message: str)")]
@@ -109,7 +136,12 @@ async fn check_signature(
     Ok(Some(pubkey.verify(message, signature).is_ok()))
 }
 
-async fn send_evers_inner(client: &TonSigner, to: MsgAddressInt, amount: u64) -> Result<String> {
+async fn send_evers_inner(
+    client: &TonSigner,
+    to: MsgAddressInt,
+    amount: u64,
+    body: Option<SliceData>,
+) -> Result<String> {
     let from =
         nekoton::core::ton_wallet::compute_address(&client.signer.public, WalletType::WalletV3, 0);
     let state = client
@@ -131,7 +163,7 @@ async fn send_evers_inner(client: &TonSigner, to: MsgAddressInt, amount: u64) ->
             bounce: false,
             destination: to.clone(),
             amount,
-            body: None,
+            body,
             state_init: None,
         }],
         Expiration::Timeout(60),
@@ -162,6 +194,32 @@ async fn send_evers_inner(client: &TonSigner, to: MsgAddressInt, amount: u64) ->
         Ok(SendStatus::Expired) => Ok("Pending".to_string()),
         Err(err) => Err(err),
     }
+}
+
+async fn call(
+    client: &TonSigner,
+    contract_address: &str,
+    attach_amount: u64,
+    abi: &str,
+    method: &str,
+    arguments: &str,
+) -> Result<String> {
+    let contract_address = MsgAddressInt::from_str(contract_address).context("Invalid address")?;
+    let abi = ton_abi::Contract::load(abi).context("Invalid abi")?;
+    let method = abi.function(method).context("Invalid method")?;
+    let arguments = serde_json::from_str(arguments).context("Invalid arguments")?;
+
+    let arguments =
+        abi::parse_abi_tokens(&method.inputs, arguments).context("Failed to parse arguments")?;
+    let input = method
+        .encode_input(&Default::default(), &arguments, true, None, None)
+        .context("Failed to encode input")?;
+    let body = input
+        .into_cell()
+        .context("Failed to pack builder data to cell")?
+        .into();
+
+    send_evers_inner(client, contract_address, attach_amount, Some(body)).await
 }
 
 /// A Python module implemented in Rust.
