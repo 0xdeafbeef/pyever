@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -8,13 +9,15 @@ use ed25519_dalek::Verifier;
 use everscale_jrpc_client::{
     JrpcClient, JrpcClientOptions, SendOptions, SendStatus, TransportErrorAction,
 };
+use log::LevelFilter;
 use nekoton::abi;
 use nekoton::core::models::Expiration;
-use nekoton::core::ton_wallet::{wallet_v3, Gift, TransferAction, WalletType};
+use nekoton::core::ton_wallet::{compute_address, ever_wallet, Gift, TransferAction, WalletType};
 use nekoton::crypto::MnemonicType;
+use pyo3::marker::Ungil;
 use pyo3::prelude::*;
 use tokio::sync::Mutex;
-use ton_block::MsgAddressInt;
+use ton_block::{GetRepresentationHash, MsgAddressInt};
 use ton_types::SliceData;
 
 mod utils;
@@ -27,21 +30,35 @@ pub struct TonSigner {
     ctx: tokio::runtime::Runtime,
 }
 
+impl TonSigner {
+    fn block_on<F>(&self, future: F) -> F::Output
+    where
+        F: Future + Send + Ungil,
+        F::Output: Send + Ungil,
+    {
+        Python::with_gil(|py| py.allow_threads(move || self.ctx.block_on(future)))
+    }
+}
+
 #[pymethods]
 impl TonSigner {
     #[new]
-    pub fn new(phrase: &str, endpoint: &str) -> PyResult<Self> {
-        let signer = nekoton::crypto::derive_from_phrase(phrase, MnemonicType::Labs(0))?;
+    pub fn new(py: Python<'_>, phrase: &str, endpoint: &str) -> PyResult<Self> {
+        let signer = nekoton::crypto::derive_from_phrase(phrase, MnemonicType::Labs(0))
+            .context("Invalid seed")?;
         let runtime = tokio::runtime::Runtime::new().context("Failed to create runtime")?;
-        let client = runtime
-            .block_on(async {
-                JrpcClient::new(
-                    [endpoint.parse().context("Bad endpoint url")?],
-                    JrpcClientOptions::default(),
-                )
-                .await
-            })
-            .context("Failed to create client")?;
+
+        let client = py.allow_threads(|| {
+            runtime
+                .block_on(async {
+                    JrpcClient::new(
+                        [endpoint.parse().context("Bad endpoint url")?],
+                        JrpcClientOptions::default(),
+                    )
+                    .await
+                })
+                .context("Failed to create client")
+        })?;
 
         Ok(Self {
             signer,
@@ -49,6 +66,22 @@ impl TonSigner {
             client,
             send_mutex: Mutex::new(()),
         })
+    }
+
+    pub fn wallet_address(&self) -> PyResult<String> {
+        let address = compute_address(&self.signer.public, WalletType::EverWallet, 0);
+        Ok(address.to_string())
+    }
+
+    pub fn balance_of(&self, address: &str) -> PyResult<u64> {
+        let address = MsgAddressInt::from_str(address).context("Bad address")?;
+        let state = self
+            .block_on(async { self.client.get_contract_state(&address).await })
+            .context("Failed to get account state")?
+            .context("Account does not exist")?
+            .brief();
+
+        Ok(state.balance)
     }
 
     #[pyo3(text_signature = "($self, hash)")]
@@ -67,9 +100,43 @@ impl TonSigner {
     pub fn send_evers(&self, to: &str, amount: u64) -> PyResult<String> {
         let to = ton_block::MsgAddressInt::from_str(to).context("Invalid address")?;
 
-        Ok(self
-            .ctx
-            .block_on(async { send_evers_inner(self, to, amount, None).await })?)
+        Ok(self.block_on(async {
+            send_evers_inner(
+                self,
+                vec![Gift {
+                    flags: 3,
+                    amount,
+                    bounce: false,
+                    destination: to,
+                    state_init: None,
+                    body: None,
+                }],
+            )
+            .await
+        })?)
+    }
+
+    #[pyo3(text_signature = "($self, contract_address, attach_amount, abi, method, arguments)")]
+    pub fn make_call_payload(
+        &self,
+        contract_address: &str,
+        attach_amount: u64,
+        abi: &str,
+        method: &str,
+        arguments: &str,
+    ) -> PyResult<SendPayload> {
+        let payload = call(
+            contract_address,
+            attach_amount,
+            abi,
+            method,
+            arguments,
+            false,
+        )?;
+
+        let payload: SendPayload = payload.try_into()?;
+
+        Ok(payload)
     }
 
     #[pyo3(text_signature = "($self, contract_address, attach_amount, abi, method, arguments)")]
@@ -81,17 +148,40 @@ impl TonSigner {
         method: &str,
         arguments: &str,
     ) -> PyResult<String> {
-        let res = self.ctx.block_on(async {
-            call(
-                self,
-                contract_address,
-                attach_amount,
-                abi,
-                method,
-                arguments,
+        let payload = call(
+            contract_address,
+            attach_amount,
+            abi,
+            method,
+            arguments,
+            false,
+        )?;
+
+        let res = self
+            .ctx
+            .block_on(async { send_evers_inner(self, vec![payload]).await })?;
+
+        Ok(res)
+    }
+
+    pub fn call_multi(&self, py: Python<'_>, payloads: PyObject) -> PyResult<String> {
+        let payloads: Vec<SendPayload> = payloads.extract(py).context("Failed to map payloads")?;
+        let payloads: Vec<Gift> = payloads
+            .into_iter()
+            .map(|payload| payload.try_into())
+            .collect::<Result<Vec<_>>>()?;
+
+        if payloads.len() > 3 || payloads.is_empty() {
+            return Err(anyhow::anyhow!(
+                "Invalid payloads count: {}. Expected 1..4",
+                payloads.len()
             )
-            .await
-        })?;
+            .into());
+        }
+
+        let res = self
+            .ctx
+            .block_on(async { send_evers_inner(self, payloads).await })?;
 
         Ok(res)
     }
@@ -136,14 +226,8 @@ async fn check_signature(
     Ok(Some(pubkey.verify(message, signature).is_ok()))
 }
 
-async fn send_evers_inner(
-    client: &TonSigner,
-    to: MsgAddressInt,
-    amount: u64,
-    body: Option<SliceData>,
-) -> Result<String> {
-    let from =
-        nekoton::core::ton_wallet::compute_address(&client.signer.public, WalletType::WalletV3, 0);
+async fn send_evers_inner(client: &TonSigner, gifts: Vec<Gift>) -> Result<String> {
+    let from = compute_address(&client.signer.public, WalletType::EverWallet, 0);
     let state = client
         .client
         .get_contract_state(&from)
@@ -151,21 +235,12 @@ async fn send_evers_inner(
         .map(|x| x.account)
         .unwrap_or_default();
 
-    let seqno_offset = 0; //todo: tweak this
-
-    let tx = wallet_v3::prepare_transfer(
+    let tx = ever_wallet::prepare_transfer(
         &nekoton::utils::SimpleClock,
         &client.signer.public,
         &state,
-        seqno_offset,
-        vec![Gift {
-            flags: 3,
-            bounce: false,
-            destination: to.clone(),
-            amount,
-            body,
-            state_init: None,
-        }],
+        from,
+        gifts,
         Expiration::Timeout(60),
     )
     .unwrap();
@@ -190,20 +265,28 @@ async fn send_evers_inner(
     let result = client.client.send_message(message, send_options).await;
 
     match result {
-        Ok(SendStatus::Confirmed) => Ok("Confirmed".to_string()),
-        Ok(SendStatus::Expired) => Ok("Pending".to_string()),
-        Err(err) => Err(err),
+        Ok(SendStatus::Confirmed(tx)) => tx_status(&tx),
+        Ok(SendStatus::Expired) => anyhow::bail!("Message expired"),
+        Err(err) => Err(err.context("internal error")),
     }
 }
 
-async fn call(
-    client: &TonSigner,
+fn tx_status(tx: &ton_block::Transaction) -> Result<String> {
+    if tx.read_description()?.is_aborted() {
+        anyhow::bail!("Transaction aborted. Hash: {}", tx.hash()?.to_hex_string());
+    } else {
+        Ok(tx.hash()?.to_hex_string())
+    }
+}
+
+fn call(
     contract_address: &str,
     attach_amount: u64,
     abi: &str,
     method: &str,
     arguments: &str,
-) -> Result<String> {
+    bounce: bool,
+) -> Result<Gift> {
     let contract_address = MsgAddressInt::from_str(contract_address).context("Invalid address")?;
     let abi = ton_abi::Contract::load(abi).context("Invalid abi")?;
     let method = abi.function(method).context("Invalid method")?;
@@ -219,12 +302,89 @@ async fn call(
         .context("Failed to pack builder data to cell")?
         .into();
 
-    send_evers_inner(client, contract_address, attach_amount, Some(body)).await
+    let gift = Gift {
+        flags: 3,
+        bounce,
+        destination: contract_address,
+        amount: attach_amount,
+        body: Some(body),
+        state_init: None,
+    };
+
+    Ok(gift)
+}
+
+#[pyclass]
+#[derive(FromPyObject)]
+pub struct SendPayload {
+    #[pyo3(get)]
+    pub flags: u8,
+    #[pyo3(get)]
+    pub bounce: bool,
+    #[pyo3(get)]
+    pub destination: String,
+    #[pyo3(get)]
+    pub amount: u64,
+    #[pyo3(get)]
+    pub body: Option<String>,
+}
+
+impl TryFrom<SendPayload> for Gift {
+    type Error = anyhow::Error;
+
+    fn try_from(value: SendPayload) -> std::result::Result<Self, Self::Error> {
+        let body = if let Some(body) = value.body {
+            let body = base64::decode(body).context("Failed to decode body")?;
+            let body = ton_types::deserialize_tree_of_cells(&mut body.as_slice())
+                .context("Failed to deserialize body")?;
+            let body = SliceData::from(body);
+            Some(body)
+        } else {
+            None
+        };
+
+        Ok(Gift {
+            flags: value.flags,
+            bounce: value.bounce,
+            destination: MsgAddressInt::from_str(&value.destination).context("Invalid address")?,
+            amount: value.amount,
+            body,
+            state_init: None,
+        })
+    }
+}
+
+impl TryFrom<Gift> for SendPayload {
+    type Error = anyhow::Error;
+
+    fn try_from(value: Gift) -> std::result::Result<Self, Self::Error> {
+        let body = if let Some(body) = value.body {
+            let body = ton_types::serialize_toc(&body.into_cell())?;
+            let body = base64::encode(body);
+            Some(body)
+        } else {
+            None
+        };
+
+        Ok(SendPayload {
+            flags: value.flags,
+            bounce: value.bounce,
+            destination: value.destination.to_string(),
+            amount: value.amount,
+            body,
+        })
+    }
 }
 
 /// A Python module implemented in Rust.
 #[pymodule]
-fn pyever_send(_py: Python, m: &PyModule) -> PyResult<()> {
+fn pyever_send(py: Python, m: &PyModule) -> PyResult<()> {
+    pyo3_log::Logger::new(py, pyo3_log::Caching::LoggersAndLevels)?
+        .filter(LevelFilter::Info)
+        .install()
+        .expect("Someone installed a logger before us :-(");
+    log::info!("Initializing pyever_send");
     m.add_class::<TonSigner>()?;
+    m.add_class::<SendPayload>()?;
     Ok(())
 }

@@ -12,8 +12,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - name: Install openssl libs
-      run: sudo apt-get install pkg-config libssl-dev
+      run: sudo apt-get install build-essential cmake pkg-config libssl-dev git llvm clang libclang-dev
     - uses: actions/checkout@v3
+    - uses: Swatinem/rust-cache@v2
+#     - name: Setup tmate session
+#       uses: mxschmitt/action-tmate@v3
     - uses: PyO3/maturin-action@v1
       with:
         manylinux: auto

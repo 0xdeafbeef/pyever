@@ -1,16 +1,38 @@
+from random import randint
+
 from pyever_send import TonSigner
 import json
 import requests as req
 
+
+def make_payload(uid: int) -> str:
+    return json.dumps({
+        "uniqueId": uid,
+        "recipient": "0:e16ba67e5c201915de32d00429f01197c3b8217d409fa2ed03817e2d9f13312c",
+        "key": "ZTU5YWYwNDIyNmNmNzVkZDUxY2U5Mjc1NDg3ZmQ1ZWYxMDQ4ZTFlYTk4ZGFjMGFiYzdjNjkwZDkyZjc0Njk0NQo=",
+        "content": "ZTU5YWYwNDIyNmNmNzVkZDUxY2U5Mjc1NDg3ZmQ1ZWYxMDQ4ZTFlYTk4ZGFjMGFiYzdjNjkwZDkyZjc0Njk0NQo=",
+    })
+
+
 seed = open("seed").read().strip()
+
 signer = TonSigner(
     seed,
     "https://jrpc.everwallet.net/rpc")
 
-# res = signer.send_evers(
-#     "0:8e2586602513e99a55fa2be08561469c7ce51a7d5a25977558e77ef2bc9387b4",
-#     1_000_000)
+your_address = signer.wallet_address()
+print("Your wallet address:", your_address)
 
+print("Your wallet balance:", signer.balance_of(your_address) / 10 ** 9)
+# you can just send evers:
+res = signer.send_evers(
+    "0:8e2586602513e99a55fa2be08561469c7ce51a7d5a25977558e77ef2bc9387b4",
+    1_000_000)
+
+# res will be hash or error
+print("Tx hash:", res)
+
+# you can check signature:
 res = signer.check_signature(
     "0:8e2586602513e99a55fa2be08561469c7ce51a7d5a25977558e77ef2bc9387b4",
     # signature
@@ -20,42 +42,27 @@ res = signer.check_signature(
 
 assert res is True
 
-payload = {
-    "amount": 1,
-    "recipient": "0:8e2586602513e99a55fa2be08561469c7ce51a7d5a25977558e77ef2bc9387b4",
-    "deployWalletValue": 100_000_000,
-    "remainingGasTo": "0:8e2586602513e99a55fa2be08561469c7ce51a7d5a25977558e77ef2bc9387b4",
-    "notify": False,
-    "payload": "te6ccgEBAQEAAgAAAA==",
-}
-
-payload = json.dumps(payload)
-
-contract_address = "0:9aada4077f3304b20331cd3c50e93e6dfa8bae725bcc9a3200820653903087e9"
-abi = \
-    req.get(
-        f"https://verify.everscan.io/info/address/{contract_address}").json()[
-        "abi"]
-
-abi = json.dumps(abi)
-# [pyo3(text_signature = "($self, contract_address, attach_amount, abi, method, arguments)")]
-res = signer.call(contract_address, 1_000_000_000, abi, "transfer", payload)
-print(res)
-
-dst = "0:e16ba67e5c201915de32d00429f01197c3b8217d409fa2ed03817e2d9f13312c"
 mailer = "0:a06a244f2632aaff3573e2fa45283fc67e3ad8a11bcba62b060fe9b60c36a0c9"
 
 mailer_abi = \
     req.get(f"https://verify.everscan.io/info/address/{mailer}").json()["abi"]
 mailer_abi = json.dumps(mailer_abi)
 
-payload = {
-    "uniqueId": 148889,
-    "recipient": dst,
-    "key": "ZTU5YWYwNDIyNmNmNzVkZDUxY2U5Mjc1NDg3ZmQ1ZWYxMDQ4ZTFlYTk4ZGFjMGFiYzdjNjkwZDkyZjc0Njk0NQo=",
-    "content": "ZTU5YWYwNDIyNmNmNzVkZDUxY2U5Mjc1NDg3ZmQ1ZWYxMDQ4ZTFlYTk4ZGFjMGFiYzdjNjkwZDkyZjc0Njk0NQo=",
-}
+res = signer.call(mailer, 1_000_000_000, mailer_abi, "sendSmallMail",
+                  make_payload(1337))
+print("tx hash:", res)
+# or you can prepare payload and send up to 3 messages in one transaction
 
-payload = json.dumps(payload)
+payloads = []
 
-res = signer.call(mailer, 1_000_000_000, mailer_abi, "sendSmallMail", payload)
+for _ in range(3):
+    rand_id = randint(0, 2 ** 32)
+    payload = make_payload(rand_id)
+    payload = prepared_payload = signer.make_call_payload(mailer, 1_000_000_000,
+                                                          mailer_abi,
+                                                          "sendSmallMail",
+                                                          payload)
+    payloads.append(payload)
+
+res = signer.call_multi(payloads)
+print("tx hash:", res)
