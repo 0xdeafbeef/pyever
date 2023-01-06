@@ -23,7 +23,7 @@ serde_json = "1.0.89"
 
 openssl = { features = ["vendored"], version = "0.10.44" }
 
-tokio = "1.23.0"
+tokio = "1.23.1"
 ton_abi = { git = "https://github.com/broxus/ton-labs-abi.git", default-features = false }
 ton_block = { git = "https://github.com/broxus/ton-labs-block.git", default-features = false }
 ton_types = { git = "https://github.com/broxus/ton-labs-types.git", default-features = false }
