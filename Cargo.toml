@@ -21,7 +21,7 @@ pyo3 = { version = "0.17.2", features = ["extension-module", "anyhow"] }
 pyo3-log = "0.7.0"
 serde_json = "1.0.89"
 
-openssl = { features = ["vendored"], version = "0.10.48" }
+openssl = { features = ["vendored"], version = "0.10.55" }
 
 tokio = "1.23.0"
 ton_abi = { git = "https://github.com/broxus/ton-labs-abi.git", default-features = false }
